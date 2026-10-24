@@ -8,6 +8,7 @@ Paperclip can run entirely on Vercel services:
 | PostgreSQL             | Vercel Postgres / Neon (Vercel Marketplace)      |
 | File + run-log storage | Vercel Blob (private store)                      |
 | Heartbeat scheduler    | Vercel Cron (every minute)                       |
+| Agent execution        | Vercel Sandbox (bundled sandbox provider plugin) |
 
 The deployment always runs in `authenticated` + `public` mode.
 
@@ -24,6 +25,10 @@ The deployment always runs in `authenticated` + `public` mode.
 - `scripts/vercel/handler.ts` boots the regular Paperclip server once per
   function instance. It sets `PAPERCLIP_SERVERLESS=true` so the server does not
   bind a port, then hands each request to the HTTP server.
+- The build bundles the Vercel Sandbox provider plugin
+  (`packages/plugins/sandbox-providers/vercel-sandbox`) into the function,
+  together with its dependencies. On Vercel the server auto-installs it from
+  that bundled catalog and runs its worker next to the server.
 - Vercel Cron calls `/api/vercel/cron/scheduler` with `CRON_SECRET`. That runs
   one heartbeat scheduler tick, because a frozen function never fires the
   in-process interval.
@@ -48,6 +53,9 @@ The deployment always runs in `authenticated` + `public` mode.
    | `CRON_SECRET`                       | `openssl rand -hex 32`                          |
    | `PAPERCLIP_BOOTSTRAP_SECRET`        | `openssl rand -hex 32` (remove after first login) |
    | `PAPERCLIP_PUBLIC_URL`              | Only with a custom domain, e.g. `https://paperclip.example.com` |
+   | `VERCEL_TOKEN`                      | Vercel access token used to create sandboxes (optional; can also be set per environment) |
+   | `VERCEL_TEAM_ID`                    | Team that owns the sandboxes (with `VERCEL_TOKEN`) |
+   | `VERCEL_PROJECT_ID`                 | Project the sandboxes are billed to, usually this project (with `VERCEL_TOKEN`) |
 
    Without a custom domain, the public URL defaults to
    `https://$VERCEL_PROJECT_PRODUCTION_URL`.
@@ -61,16 +69,23 @@ The deployment always runs in `authenticated` + `public` mode.
    It returns a one-time `inviteUrl`. Open that URL, sign up, and accept the
    invite. The endpoint returns `409` once an admin exists, and `404` while
    `PAPERCLIP_BOOTSTRAP_SECRET` is unset. Remove the variable after setup.
+7. Set up agent execution. In `Instance Settings -> Environments`, create a
+   sandbox environment with the provider **Vercel Sandbox**. Use **Test** to
+   probe it, then run your agents in it. The default image,
+   `vercel/sandbox/universal`, already ships Node.js 24 and common coding agent
+   CLIs. See the plugin
+   [README](../packages/plugins/sandbox-providers/vercel-sandbox/README.md)
+   for every option.
 
 ## Limits
 
 - **Plan:** Vercel Pro (or higher) is required. Hobby allows only daily cron
   jobs, and the scheduler needs to run every minute. Hobby also caps functions
   far below the 800 s this deployment uses.
-- **Local agent adapters** (`claude_local`, `codex_local`, `cursor_local`, …)
-  start CLI processes on the server, which a Vercel Function cannot do. Use
-  cloud adapters (for example `cursor_cloud`, Hermes/OpenClaw gateways) or a
-  sandbox environment provider.
+- **Agents need a sandbox environment.** Local agent adapters (`claude_local`,
+  `codex_local`, …) start CLI processes. A Vercel Function cannot do that on
+  the server itself, so run them in a Vercel Sandbox environment (step 7).
+  Cloud adapters such as `cursor_cloud` work without a sandbox.
 - **Run length:** one function invocation lasts at most `maxDuration`
   (800 s). The orphaned-run reaper cleans up longer runs.
 - **Live updates:** Vercel Functions cannot accept WebSocket upgrades. The board

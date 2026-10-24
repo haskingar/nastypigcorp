@@ -9,6 +9,7 @@ import {
   ensureBundledPlugins,
   resolveBundledCatalogRoot,
   resolveBundledPluginInstalls,
+  resolveSelfHostedAutoInstallKeys,
   type BundledPluginProvisionerDeps,
   type ResolvedBundledPlugin,
 } from "../services/bundled-plugins.js";
@@ -179,6 +180,21 @@ describe("resolveBundledPluginInstalls", () => {
       pluginKey: "paperclip.kubernetes-sandbox-provider",
       localPath: "/app/packages/plugins/sandbox-providers/kubernetes",
     });
+  });
+
+  it("adds the Vercel Sandbox provider only on serverless (Vercel) deployments", () => {
+    expect(resolveSelfHostedAutoInstallKeys({})).toEqual(["kubernetes"]);
+    expect(resolveSelfHostedAutoInstallKeys({ VERCEL: "1" })).toEqual(["kubernetes", "vercel-sandbox"]);
+    expect(resolveSelfHostedAutoInstallKeys({ PAPERCLIP_SERVERLESS: "true" })).toEqual(["kubernetes", "vercel-sandbox"]);
+    expect(resolveBundledPluginInstalls(["vercel-sandbox"], {
+      catalogRoot: CATALOG_ROOT,
+      env: {},
+      enforceCatalogRoot: true,
+    })).toEqual([{
+      key: "vercel-sandbox",
+      pluginKey: "paperclip.vercel-sandbox-provider",
+      localPath: path.join(CATALOG_ROOT, "sandbox-providers/vercel-sandbox"),
+    }]);
   });
 
   it("covers every catalog entry with a path inside the default root", () => {

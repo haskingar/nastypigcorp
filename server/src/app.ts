@@ -176,7 +176,7 @@ import {
   type PluginLoader,
 } from "./services/plugin-loader.js";
 import {
-  SELF_HOSTED_AUTO_INSTALL_KEYS,
+  resolveSelfHostedAutoInstallKeys,
   BUNDLED_PLUGIN_CATALOG,
   ensureBundledPlugins,
   resolveBundledCatalogRoot,
@@ -720,7 +720,7 @@ export async function createApp(
     opts.bundledPluginCatalogRoot ?? resolveBundledCatalogRoot(process.env);
   const distributionPlugins = readDistributionPluginCatalog(bundledCatalogRoot, BUNDLED_PLUGIN_CATALOG);
   const bundledPluginInstalls = resolveBundledPluginInstalls(
-    managedAutoInstallKeys ?? SELF_HOSTED_AUTO_INSTALL_KEYS,
+    managedAutoInstallKeys ?? resolveSelfHostedAutoInstallKeys(process.env),
     {
       catalogRoot: bundledCatalogRoot,
       env: process.env,

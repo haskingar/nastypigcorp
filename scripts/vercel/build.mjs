@@ -47,6 +47,10 @@ const TRACE_IGNORE = (path) =>
 
 const SCHEDULER_CRON_PATH = "/api/vercel/cron/scheduler";
 
+// Sandbox provider plugins shipped inside the function. The server
+// auto-installs them from the bundled catalog (packages/plugins) on Vercel.
+const BUNDLED_SANDBOX_PLUGINS = ["packages/plugins/sandbox-providers/vercel-sandbox"];
+
 function log(message) {
   console.log(`[vercel-build] ${message}`);
 }
@@ -308,6 +312,27 @@ async function buildFunction() {
   log(`function contains ${fileList.size} traced files`);
 }
 
+// Plugin workers are forked from <plugin>/dist/worker.js and loaded without
+// npm install, so each one is bundled with all of its dependencies.
+async function bundleSandboxPlugins() {
+  for (const pluginDir of BUNDLED_SANDBOX_PLUGINS) {
+    const sourceDir = join(repoRoot, pluginDir);
+    const targetDir = join(functionDir, pluginDir);
+    await build({
+      entryPoints: { manifest: join(sourceDir, "src", "manifest.ts"), worker: join(sourceDir, "src", "worker.ts") },
+      outdir: join(targetDir, "dist"),
+      bundle: true,
+      format: "esm",
+      platform: "node",
+      target: "node24",
+      banner: { js: REQUIRE_SHIM },
+      logLevel: "warning",
+    });
+    await copyFile(join(sourceDir, "package.json"), join(targetDir, "package.json"));
+    log(`bundled plugin ${pluginDir}`);
+  }
+}
+
 async function writeConfig() {
   const config = {
     version: 3,
@@ -343,6 +368,7 @@ async function main() {
   await bundleServer();
   log("tracing server dependencies");
   await buildFunction();
+  await bundleSandboxPlugins();
   await writeConfig();
   log(`done: ${toPosix(relative(repoRoot, outputDir))}`);
 }

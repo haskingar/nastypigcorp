@@ -272,6 +272,34 @@ describe("buildPluginWorkerEnv", () => {
     });
   });
 
+  it("passes only the Vercel Sandbox credentials to the bundled Vercel Sandbox worker", () => {
+    const env = buildPluginWorkerEnv({
+      manifest: {
+        capabilities: ["environment.drivers.register"],
+        environmentDrivers: [{ driverKey: "vercel-sandbox" }],
+      },
+      packageName: "@paperclipai/plugin-vercel-sandbox",
+      packagePath: "/var/task/packages/plugins/sandbox-providers/vercel-sandbox",
+      trustedLocalPluginRoots: ["/var/task/packages/plugins"],
+      instanceInfo,
+      processEnv: {
+        VERCEL_TOKEN: "vercel-token",
+        VERCEL_TEAM_ID: "team_1",
+        VERCEL_PROJECT_ID: "prj_1",
+        VERCEL_URL: "paperclip.vercel.app",
+        BLOB_READ_WRITE_TOKEN: "blob-token",
+      },
+    });
+
+    expect(env).toEqual({
+      PAPERCLIP_DEPLOYMENT_MODE: "authenticated",
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: "public",
+      VERCEL_TOKEN: "vercel-token",
+      VERCEL_TEAM_ID: "team_1",
+      VERCEL_PROJECT_ID: "prj_1",
+    });
+  });
+
   it("does not pass the credential to a local plugin that self-declares the first-party name", () => {
     const env = buildPluginWorkerEnv({
       manifest: {

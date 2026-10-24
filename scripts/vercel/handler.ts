@@ -42,6 +42,11 @@ function applyVercelDefaults(env: NodeJS.ProcessEnv): void {
   env.PAPERCLIP_MIGRATION_AUTO_APPLY ??= "true";
   env.PAPERCLIP_DB_BACKUP_ENABLED ??= "false";
   env.SERVE_UI ??= "true";
+  // Sandbox provider plugins ship in the function (scripts/vercel/build.mjs).
+  env.PAPERCLIP_BUNDLED_PLUGIN_ROOT ??= decodeURIComponent(new URL("../../packages/plugins", import.meta.url).pathname);
+  // Those plugins are prebuilt with their dependencies inlined; there is no
+  // package manager or writable source tree to rebuild them with.
+  env.PAPERCLIP_DISABLE_PLUGIN_AUTOBUILD ??= "1";
 }
 
 applyVercelDefaults(process.env);

@@ -104,6 +104,11 @@ export const BUNDLED_PLUGIN_CATALOG: readonly BundledPluginCatalogEntry[] = [
     pluginKey: "paperclip.novita-sandbox-provider",
     relativePath: "sandbox-providers/novita",
   },
+  {
+    key: "vercel-sandbox",
+    pluginKey: "paperclip.vercel-sandbox-provider",
+    relativePath: "sandbox-providers/vercel-sandbox",
+  },
 ];
 
 /**
@@ -112,6 +117,17 @@ export const BUNDLED_PLUGIN_CATALOG: readonly BundledPluginCatalogEntry[] = [
  * auto-installed when its bundle is present, nothing else.
  */
 export const SELF_HOSTED_AUTO_INSTALL_KEYS: readonly string[] = ["kubernetes"];
+
+/**
+ * Self-hosted keys for this process. A Vercel deployment cannot run local
+ * agent CLIs, so it also ensures the Vercel Sandbox provider its build ships.
+ */
+export function resolveSelfHostedAutoInstallKeys(
+  env: Record<string, string | undefined>,
+): readonly string[] {
+  const serverless = env.PAPERCLIP_SERVERLESS === "true" || env.VERCEL === "1";
+  return serverless ? [...SELF_HOSTED_AUTO_INSTALL_KEYS, "vercel-sandbox"] : SELF_HOSTED_AUTO_INSTALL_KEYS;
+}
 
 export function resolveBundledCatalogRoot(
   env: Record<string, string | undefined>,
