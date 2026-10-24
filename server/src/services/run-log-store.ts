@@ -6,6 +6,7 @@ import { addAbortSignal } from "node:stream";
 import { notFound } from "../errors.js";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { createS3StorageProvider } from "../storage/s3-provider.js";
+import { createVercelBlobStorageProvider } from "../storage/vercel-blob-provider.js";
 import type { StorageProvider } from "../storage/types.js";
 
 export type RunLogStoreType = "local_file";
@@ -483,8 +484,18 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
 // NOT redirect the product's workspace/file storage (smaller blast radius).
 // Unset RUN_LOG_S3_BUCKET -> no mirror -> local-only (safe degrade). Creds come
 // from the standard AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY chain.
+// Vercel deployments have no durable local disk, so when product storage is
+// Vercel Blob the run-log mirror follows it unless RUN_LOG_S3_BUCKET says
+// otherwise.
 function resolveRunLogS3(): DurableRunLogStoreOptions["s3"] {
   const bucket = process.env.RUN_LOG_S3_BUCKET?.trim();
+  if (!bucket && process.env.PAPERCLIP_STORAGE_PROVIDER === "vercel_blob") {
+    return {
+      provider: createVercelBlobStorageProvider({ token: process.env.BLOB_READ_WRITE_TOKEN }),
+      keyPrefix: process.env.RUN_LOG_S3_PREFIX?.trim() || "run-logs",
+      inflightMirrorMs: 15_000,
+    };
+  }
   if (!bucket) return undefined;
   const provider = createS3StorageProvider({
     bucket,

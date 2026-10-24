@@ -819,7 +819,7 @@ export const CLASS3_STATIC_LEASE_ALLOWLIST = [
 ] as const;
 export type Class3StaticLeaseAllowlistKey = (typeof CLASS3_STATIC_LEASE_ALLOWLIST)[number]["key"];
 
-export const STORAGE_PROVIDERS = ["local_disk", "s3"] as const;
+export const STORAGE_PROVIDERS = ["local_disk", "s3", "vercel_blob"] as const;
 export type StorageProvider = (typeof STORAGE_PROVIDERS)[number];
 
 export const BILLING_TYPES = [

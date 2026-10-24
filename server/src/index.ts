@@ -205,6 +205,20 @@ export interface StartedServer {
   apiUrl: string;
   databaseUrl: string;
   shutdown: (signal?: "SIGINT" | "SIGTERM") => Promise<void>;
+  /**
+   * Runs one scheduler tick and resolves once the work it started settles.
+   * Serverless hosts (Vercel Cron) call this because a frozen function
+   * instance never fires the in-process interval.
+   */
+  runSchedulerTick: () => Promise<void>;
+}
+
+/**
+ * Serverless hosts (Vercel) hand requests to the HTTP server directly, so the
+ * process must not bind a port of its own.
+ */
+export function isServerlessRuntime(): boolean {
+  return process.env.PAPERCLIP_SERVERLESS === "true" || process.env.VERCEL === "1";
 }
 
 // Set by the boot sequence once the primary pool exists. A boot that fails
@@ -717,11 +731,14 @@ async function startServerWithDatabaseTeardown(
     }
   }
 
+  const serverless = isServerlessRuntime();
   const requestedListenPort = config.port;
-  const listenPort = await detectPort({
-    port: requestedListenPort,
-    hostname: config.host,
-  });
+  const listenPort = serverless
+    ? requestedListenPort
+    : await detectPort({
+      port: requestedListenPort,
+      hostname: config.host,
+    });
   if (config.authBaseUrlMode === "explicit" && config.authPublicBaseUrl) {
     config.authPublicBaseUrl = rewriteLoopbackUrlPort(config.authPublicBaseUrl, listenPort);
   }
@@ -1040,7 +1057,7 @@ async function startServerWithDatabaseTeardown(
   // to this address; delaying listen until after orphan reconciliation makes
   // authenticated adoption impossible and turns a healthy process into a
   // duplicate-provider risk.
-  await new Promise<void>((resolveListen, rejectListen) => {
+  if (!serverless) await new Promise<void>((resolveListen, rejectListen) => {
     const onError = (err: Error) => {
       server.off("error", onError);
       rejectListen(err);
@@ -1054,7 +1071,7 @@ async function startServerWithDatabaseTeardown(
       resolveListen();
     });
   });
-  startupListenerBound = true;
+  startupListenerBound = !serverless;
 
   try {
     const result = await workspaceOperationService(db as any)
@@ -1196,6 +1213,7 @@ async function startServerWithDatabaseTeardown(
   }>) | null = null;
   let heartbeatSchedulerStopped = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
+  let heartbeatSchedulerTick: (() => void) | null = null;
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
     const finishIdleWork = beginIdleTrackedWork();
@@ -1214,6 +1232,7 @@ async function startServerWithDatabaseTeardown(
     }
   };
   const startHeartbeatSchedulerInterval = (callback: () => void) => {
+    heartbeatSchedulerTick = callback;
     heartbeatSchedulerInterval = setInterval(() => {
       if (!isWarmStandby() && !isIdleTaskDrainActive()) callback();
     }, config.heartbeatSchedulerIntervalMs);
@@ -1493,7 +1512,7 @@ async function startServerWithDatabaseTeardown(
         storage: storageService,
         terminalDelayMs: config.gitRestorePointTerminalDelayDays * 24 * 60 * 60 * 1000,
         idleMs: config.gitRestorePointIdleDays > 0 ? config.gitRestorePointIdleDays * 24 * 60 * 60 * 1000 : null,
-        keyDurable: config.storageProvider !== "s3" || Boolean(process.env.PAPERCLIP_SECRETS_MASTER_KEY?.trim()),
+        keyDurable: config.storageProvider === "local_disk" || Boolean(process.env.PAPERCLIP_SECRETS_MASTER_KEY?.trim()),
       } : undefined,
       workspaceReaperCooldownDays: config.workspaceReaperCooldownDays,
       workspaceCompactionDelayMs: config.workspaceCompactionDelayHours === null
@@ -2211,6 +2230,13 @@ async function startServerWithDatabaseTeardown(
     apiUrl: configuredApiUrl,
     databaseUrl: activeDatabaseConnectionString,
     shutdown: (signal = "SIGTERM") => shutdown(signal, false),
+    runSchedulerTick: async () => {
+      // Startup housekeeping registers the tick; wait for it on a cold start.
+      await waitForHeartbeatSchedulerIdle();
+      if (heartbeatSchedulerStopped || isWarmStandby() || isIdleTaskDrainActive()) return;
+      heartbeatSchedulerTick?.();
+      await waitForHeartbeatSchedulerIdle();
+    },
   };
   } catch (error) {
     if (startupListenerBound) {
