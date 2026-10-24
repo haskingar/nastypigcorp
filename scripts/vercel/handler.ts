@@ -6,6 +6,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 
 const VERCEL_CRON_PATH = "/api/vercel/cron/scheduler";
+const VERCEL_BOOTSTRAP_PATH = "/api/vercel/bootstrap-ceo";
 
 // Every instance must agree on these. Without them the server would generate
 // per-instance values on the ephemeral disk and sessions, stored secrets and
@@ -52,7 +53,7 @@ function startOnce(): Promise<StartedServer> {
   if (!started) {
     const missing = REQUIRED_ENV.filter((name) => !process.env[name]?.trim());
     if (missing.length > 0) {
-      return Promise.reject(new Error(`Missing required Vercel environment variables: ${missing.join(", ")}`));
+      return Promise.reject(new MissingEnvError(`Missing required Vercel environment variables: ${missing.join(", ")}`));
     }
     started = import("../../server/src/index.js").then(({ startServer }) => startServer());
     // A failed boot must not poison the warm instance; the next request retries.
@@ -63,12 +64,27 @@ function startOnce(): Promise<StartedServer> {
   return started;
 }
 
+class MissingEnvError extends Error {}
+
+function secretMatches(secret: string | undefined, provided: string | null | undefined): boolean {
+  if (!secret || !provided) return false;
+  const expected = Buffer.from(secret);
+  const actual = Buffer.from(provided);
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
+
 function isAuthorizedCron(req: IncomingMessage): boolean {
   const secret = process.env.CRON_SECRET?.trim();
+  return secretMatches(secret && `Bearer ${secret}`, req.headers.authorization);
+}
+
+// Opened once from a browser, so the secret may come as ?secret=. The route
+// only exists while PAPERCLIP_BOOTSTRAP_SECRET is set and no admin exists.
+function isAuthorizedBootstrap(req: IncomingMessage, url: URL): boolean {
+  const secret = process.env.PAPERCLIP_BOOTSTRAP_SECRET?.trim();
   if (!secret) return false;
-  const expected = Buffer.from(`Bearer ${secret}`);
-  const actual = Buffer.from(req.headers.authorization ?? "");
-  return expected.length === actual.length && timingSafeEqual(expected, actual);
+  const header = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+  return secretMatches(secret, header ?? url.searchParams.get("secret"));
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
@@ -84,11 +100,14 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
     instance = await startOnce();
   } catch (err) {
     console.error("Paperclip failed to start on Vercel", err);
-    sendJson(res, 503, { error: err instanceof Error ? err.message : "Paperclip failed to start" });
+    // Only configuration gaps are safe to show publicly; details are in the logs.
+    const message = err instanceof MissingEnvError ? err.message : "Paperclip failed to start; see the function logs";
+    sendJson(res, 503, { error: message });
     return;
   }
 
-  const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+  const url = new URL(req.url ?? "/", "http://localhost");
+  const pathname = url.pathname;
   if (pathname === VERCEL_CRON_PATH) {
     if (!isAuthorizedCron(req)) {
       sendJson(res, 401, { error: "Unauthorized" });
@@ -96,6 +115,17 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
     }
     await instance.runSchedulerTick();
     sendJson(res, 200, { ok: true });
+    return;
+  }
+  if (pathname === VERCEL_BOOTSTRAP_PATH) {
+    if (!isAuthorizedBootstrap(req, url)) {
+      sendJson(res, 404, { error: "Not found" });
+      return;
+    }
+    const { createBootstrapCeoInvite } = await import("../../server/src/vercel-bootstrap-ceo.js");
+    const baseUrl = process.env.PAPERCLIP_PUBLIC_URL ?? process.env.PAPERCLIP_AUTH_PUBLIC_BASE_URL ?? instance.apiUrl;
+    const result = await createBootstrapCeoInvite(instance.databaseUrl, baseUrl);
+    sendJson(res, result.status === "created" ? 200 : 409, result);
     return;
   }
 

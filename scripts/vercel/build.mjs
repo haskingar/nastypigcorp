@@ -12,10 +12,11 @@
 // Usage: node scripts/vercel/build.mjs [--skip-ui]
 
 import { spawnSync } from "node:child_process";
-import { cp, lstat, mkdir, readFile, readlink, realpath, rm, symlink, writeFile, copyFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
-import { dirname, join, relative, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { cp, lstat, mkdir, readdir, readFile, readlink, realpath, rm, symlink, writeFile, copyFile } from "node:fs/promises";
+import { existsSync, statSync } from "node:fs";
+import { basename, dirname, join, relative, sep } from "node:path";
+import { createRequire } from "node:module";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { build } from "esbuild";
 import { nodeFileTrace } from "@vercel/nft";
 
@@ -34,8 +35,15 @@ const RUNTIME_ASSET_DIRS = [
   "skills",
   "packages/skills-catalog",
   "packages/teams-catalog",
-  "ui/dist",
+  // The server renders the branded SPA shell; assets are served statically.
+  "ui/dist/index.html",
 ];
+
+// Never needed on Vercel: Postgres is always external (DATABASE_URL), the
+// runtime is glibc-based, and local agent CLI binaries cannot run inside a
+// function. Keeps the function under the 250 MB size limit.
+const TRACE_IGNORE = (path) =>
+  /(^|\/)node_modules\/(@embedded-postgres\/|embedded-postgres\/|@img\/[^/]*linuxmusl|@github\/copilot-)/.test(path);
 
 const SCHEDULER_CRON_PATH = "/api/vercel/cron/scheduler";
 
@@ -80,6 +88,32 @@ const keepModuleLocations = {
   },
 };
 
+// The server loads the runner package through source shims that import its
+// TypeScript by computed URL at runtime (the regular build swaps in a compiled
+// dist instead). Here the shims become static re-exports so esbuild bundles
+// the runner source like any other workspace package.
+const RUNNER_SHIMS = new Map([
+  [join(repoRoot, "server/src/vendor/paperclip-runner/index.ts"), join(repoRoot, "packages/paperclip-runner/src/index.ts")],
+  [join(repoRoot, "server/src/vendor/paperclip-runner/live/index.ts"), join(repoRoot, "packages/paperclip-runner/src/live/index.ts")],
+]);
+
+const bundleRunnerSource = {
+  name: "bundle-runner-source",
+  setup(builder) {
+    builder.onLoad({ filter: /[\\/]vendor[\\/]paperclip-runner[\\/]/ }, (args) => {
+      const target = RUNNER_SHIMS.get(args.path);
+      if (!target) return undefined;
+      return { contents: `export * from ${JSON.stringify(target)};\n`, loader: "ts", resolveDir: dirname(target) };
+    });
+  },
+};
+
+// Real paths of every external third-party module the bundle imports. These,
+// not the multi-megabyte bundle chunks, are what @vercel/nft traces.
+const externalModuleFiles = new Set();
+// Directories of the workspace modules esbuild inlined.
+const inlinedModuleDirs = new Set();
+
 // Third-party packages stay external. They are imported by a path relative to
 // the bundle so packages only another workspace package depends on still
 // resolve once the files are copied into the function.
@@ -101,6 +135,7 @@ const externalizeThirdParty = {
       }
       if (!resolved.path.includes(`${sep}node_modules${sep}`)) return undefined;
       const real = await realpath(resolved.path);
+      externalModuleFiles.add(real);
       let rel = toPosix(relative(bundleDir, real));
       if (!rel.startsWith(".")) rel = `./${rel}`;
       return { path: rel, external: true };
@@ -126,11 +161,85 @@ async function bundleServer() {
     sourcemap: "linked",
     metafile: true,
     logLevel: "warning",
-    plugins: [keepModuleLocations, externalizeThirdParty],
+    plugins: [bundleRunnerSource, keepModuleLocations, externalizeThirdParty],
   });
+  for (const input of Object.keys(result.metafile.inputs)) {
+    if (!input.includes("node_modules/") && !input.includes(":")) inlinedModuleDirs.add(dirname(join(repoRoot, input)));
+  }
   const chunks = Object.keys(result.metafile.outputs).filter((file) => file.endsWith(".mjs"));
-  log(`bundled ${Object.keys(result.metafile.inputs).length} inputs into ${chunks.length} chunks`);
-  return chunks.map((file) => join(repoRoot, file));
+  log(
+    `bundled ${Object.keys(result.metafile.inputs).length} inputs into ${chunks.length} chunks ` +
+      `with ${externalModuleFiles.size} external modules`,
+  );
+}
+
+// Inlined modules locate sibling files (scripts, skills, migrations) with
+// `new URL("<asset>", import.meta.url)`, which keepModuleLocations rewrote to
+// `new URL("<asset>", new URL("<module>", import.meta.url))`. Collect every
+// such asset that exists in the checkout so the function ships it.
+async function discoverModuleAssets() {
+  const pattern = /new URL\(\s*"([^"]+)",\s*new URL\("([^"]+)", import\.meta\.url\)/g;
+  const assets = new Set();
+  for (const file of await readdir(bundleDir)) {
+    if (!file.endsWith(".mjs")) continue;
+    const source = await readFile(join(bundleDir, file), "utf8");
+    for (const [, asset, modulePath] of source.matchAll(pattern)) {
+      const target = fileURLToPath(new URL(asset, pathToFileURL(join(bundleDir, modulePath))));
+      if (!target.startsWith(repoRoot + sep) || !existsSync(target)) continue;
+      if (/\.[cm]?tsx?$/.test(target)) continue;
+      // Package roots and source trees are anchors for further path math, not
+      // assets; the code under them is already in the bundle.
+      if (statSync(target).isDirectory() && (basename(target) === "src" || existsSync(join(target, "package.json")))) {
+        continue;
+      }
+      assets.add(toPosix(relative(repoRoot, target)));
+    }
+  }
+  // Modules also read siblings by other means (readFileSync of a joined
+  // path, spawn of a script): ship every non-code file next to them.
+  for (const dir of inlinedModuleDirs) {
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      if (!entry.isFile() || NON_ASSET_FILE.test(entry.name)) continue;
+      assets.add(toPosix(relative(repoRoot, join(dir, entry.name))));
+    }
+  }
+  return [...assets].filter((asset) => asset !== "" && !asset.startsWith("node_modules"));
+}
+
+const NON_ASSET_FILE = /(\.[cm]?tsx?|\.map|\.test\.[cm]?[jt]sx?|\.snap|^tsconfig.*\.json|^vitest\.config\..*)$/;
+
+function nearestPackageDir(dir) {
+  for (let current = dir; current.startsWith(repoRoot); current = dirname(current)) {
+    if (existsSync(join(current, "package.json"))) return current;
+  }
+  return null;
+}
+
+// Inlined code also loads packages at runtime with createRequire() anchored at
+// its source file (ws, ssh2, @opentelemetry/api, ...). Ship each inlined
+// workspace package's node_modules links and trace their targets so those
+// lookups resolve exactly as in the checkout.
+async function collectWorkspaceDependencyLinks() {
+  const packageDirs = new Set([...inlinedModuleDirs].map(nearestPackageDir).filter(Boolean));
+  const links = [];
+  for (const packageDir of packageDirs) {
+    const manifest = JSON.parse(await readFile(join(packageDir, "package.json"), "utf8"));
+    const requireFromPackage = createRequire(join(packageDir, "package.json"));
+    for (const name of Object.keys({ ...manifest.dependencies, ...manifest.optionalDependencies })) {
+      if (name.startsWith("@paperclipai/")) continue;
+      const link = join(packageDir, "node_modules", name);
+      if (!existsSync(link) || TRACE_IGNORE(toPosix(relative(repoRoot, link)))) continue;
+      links.push(toPosix(relative(repoRoot, link)));
+      const target = await realpath(link);
+      if (existsSync(join(target, "package.json"))) externalModuleFiles.add(join(target, "package.json"));
+      try {
+        externalModuleFiles.add(await realpath(requireFromPackage.resolve(name)));
+      } catch {
+        // ESM-only or type-only packages: the bundle's own imports cover them.
+      }
+    }
+  }
+  return links;
 }
 
 async function copyTracedFile(file) {
@@ -146,25 +255,36 @@ async function copyTracedFile(file) {
   await copyFile(source, target);
 }
 
-async function buildFunction(entryFiles) {
+async function buildFunction() {
   await rm(functionDir, { recursive: true, force: true });
   await mkdir(functionDir, { recursive: true });
-  const { fileList, warnings } = await nodeFileTrace(entryFiles, {
+  const dependencyLinks = await collectWorkspaceDependencyLinks();
+  const { fileList, warnings } = await nodeFileTrace([...externalModuleFiles], {
     base: repoRoot,
     processCwd: repoRoot,
+    ignore: TRACE_IGNORE,
   });
-  for (const warning of warnings) {
-    if (!String(warning?.message ?? warning).includes("Failed to resolve dependency")) continue;
-    console.warn(`[vercel-build] trace warning: ${warning.message ?? warning}`);
+  // Unresolved optional/platform-specific dependencies (other OS binaries,
+  // bun:*, pg-native, ...) are expected; list them with PAPERCLIP_VERCEL_TRACE_VERBOSE=1.
+  const unresolved = [...warnings].filter((warning) => String(warning?.message ?? warning).includes("Failed to resolve dependency"));
+  if (process.env.PAPERCLIP_VERCEL_TRACE_VERBOSE === "1") {
+    for (const warning of unresolved) console.warn(`[vercel-build] trace warning: ${warning.message ?? warning}`);
+  } else if (unresolved.length > 0) {
+    log(`skipped ${unresolved.length} unresolvable optional dependencies`);
   }
-  for (const file of fileList) await copyTracedFile(file);
-  for (const dir of RUNTIME_ASSET_DIRS) {
+  for (const file of [...fileList, ...dependencyLinks]) {
+    if (!file.endsWith(".map")) await copyTracedFile(file);
+  }
+  const moduleAssets = await discoverModuleAssets();
+  log(`copying ${moduleAssets.length} module-relative assets`);
+  for (const dir of [toPosix(relative(repoRoot, bundleDir)), ...RUNTIME_ASSET_DIRS, ...moduleAssets]) {
     const source = join(repoRoot, dir);
     if (!existsSync(source)) continue;
     await cp(source, join(functionDir, dir), {
       recursive: true,
       verbatimSymlinks: true,
-      filter: (path) => !path.includes(`${sep}node_modules${sep}`) && !path.endsWith(`${sep}node_modules`),
+      filter: (path) =>
+        !path.includes(`${sep}node_modules${sep}`) && !path.endsWith(`${sep}node_modules`) && !path.endsWith(".map"),
     });
   }
   await writeFile(
@@ -220,9 +340,9 @@ async function main() {
   run("pnpm", ["--filter", "@paperclipai/plugin-sdk", "build"]);
 
   log("bundling server");
-  const entryFiles = await bundleServer();
+  await bundleServer();
   log("tracing server dependencies");
-  await buildFunction(entryFiles);
+  await buildFunction();
   await writeConfig();
   log(`done: ${toPosix(relative(repoRoot, outputDir))}`);
 }
